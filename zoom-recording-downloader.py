@@ -27,6 +27,8 @@ import requests
 import time
 import sys
 import os
+import urllib.parse
+import time
 APP_VERSION = "2.1"
 
 # JWT_TOKEN now lives in appenv.py
@@ -36,11 +38,11 @@ AUTHORIZATION_HEADER = {'Authorization': ACCESS_TOKEN}
 API_ENDPOINT_USER_LIST = 'https://api.zoom.us/v2/users'
 
 # Start date now split into YEAR, MONTH, and DAY variables (Within 6 month range)
-RECORDING_START_YEAR = 2022
+RECORDING_START_YEAR = 2019
 RECORDING_START_MONTH = 1
 RECORDING_START_DAY = 1
 RECORDING_END_DATE = date.today()
-# RECORDING_END_DATE = date(2021, 8, 1)
+# RECORDING_END_DATE = date(2021, 4, 1)
 DOWNLOAD_DIRECTORY = 'downloads'
 COMPLETED_MEETING_IDS_LOG = 'completed-downloads.log'
 COMPLETED_MEETING_IDS = set()
@@ -75,8 +77,7 @@ def get_credentials(host_id, page_number, rec_start_date):
 
 def get_user_ids():
     # get total page count, convert to integer, increment by 1
-    response = requests.get(url=API_ENDPOINT_USER_LIST,
-                            headers=AUTHORIZATION_HEADER)
+    response = requests.get(url=API_ENDPOINT_USER_LIST, headers=AUTHORIZATION_HEADER)
     if not response.ok:
         print(response)
         print('Is your JWT still valid?')
@@ -101,19 +102,40 @@ def get_user_ids():
 
 def format_filename(recording, file_type, file_extension, recording_type, recording_id):
     uuid = recording['uuid']
-    topic = recording['topic'].replace('/', '&')
+    topic = recording['topic']
+    topic = clean_unwanted_characters(topic, '&')
     rec_type = recording_type.replace("_", " ").title()
     meeting_time = parse(recording['start_time']).strftime('%Y.%m.%d - %I.%M %p UTC')
     return '{} - {} - {}.{}'.format(
-        meeting_time, topic+" - "+rec_type, recording_id, file_extension.lower()),'{} - {}'.format(topic, meeting_time)
+        meeting_time, topic+" - "+rec_type, recording_id, file_extension.lower()),'{} - {}'.format(meeting_time, topic)
 
+def clean_unwanted_characters(string, replacingCharacter):
+    string = string.replace(':', replacingCharacter)
+    string = string.replace('/', replacingCharacter)
+    string = string.replace('\\', replacingCharacter)
+    string = string.replace('*', replacingCharacter)
+    string = string.replace('?', replacingCharacter)
+    string = string.replace('\"', replacingCharacter)
+    string = string.replace('<', replacingCharacter)
+    string = string.replace('>', replacingCharacter)
+    string = string.replace('|', replacingCharacter)
+    return string
 
-def get_downloads(recording):
+def get_downloads(recording):    
     downloads = []
+
+    if recording.get('recording_files') == None:
+      print("==> NO recording files here! Skipping")
+      return downloads
+    
     for download in recording['recording_files']:
         file_type = download['file_type']
         file_extension = download['file_extension']
         recording_id = download['id']
+
+        if not (download['recording_type'] == 'shared_screen_with_speaker_view' or download['recording_type'] == 'active_speaker'):
+            continue
+        
         if file_type == "":
             recording_type = 'incomplete'
             #print("\download is: {}".format(download))
@@ -122,6 +144,7 @@ def get_downloads(recording):
         else:
             recording_type = download['file_type']
         # must append JWT token to download_url
+        
         download_url = download['download_url'] + "?access_token=" + JWT_TOKEN
         downloads.append((file_type, file_extension, download_url, recording_type, recording_id))
     return downloads
@@ -140,8 +163,9 @@ def get_recordings(email, page_size, rec_start_date, rec_end_date):
 def perdelta(start, end, delta):
     curr = start
     while curr < end:
-        yield curr, min(curr + delta, end)
-        curr += delta
+        nextCurr = curr + delta - timedelta(days=1)
+        yield curr, min(nextCurr, end)
+        curr += delta + timedelta(days=1)
 
 
 def list_recordings(email):
@@ -164,22 +188,43 @@ def download_recording(download_url, email, filename, foldername):
 
     # total size in bytes.
     total_size = int(response.headers.get('content-length', 0))
+    
     block_size = 32 * 1024  # 32 Kibibytes
 
-    # create TQDM progress bar
-    t = tqdm(total=total_size, unit='iB', unit_scale=True)
+    # Confirm file download before completed
     try:
-        with open(full_filename, 'wb') as fd:
-            # with open(os.devnull, 'wb') as fd:  # write to dev/null when testing
-            for chunk in response.iter_content(block_size):
-                t.update(len(chunk))
-                fd.write(chunk)  # write video chunk to disk
-        t.close()
-        return True
-    except Exception as e:
-        # if there was some exception, print the error and return False
-        print(e)
-        return False
+        file_size = os.stat(full_filename).st_size
+        if file_size == total_size:
+            return True
+    except:
+        pass
+
+    while True:
+        # create TQDM progress bar
+        t = tqdm(total=total_size, unit='iB', unit_scale=True)
+        try:
+            with open(full_filename, 'wb') as fd:
+                # with open(os.devnull, 'wb') as fd:  # write to dev/null when testing
+                for chunk in response.iter_content(block_size):
+                    t.update(len(chunk))
+                    fd.write(chunk)  # write video chunk to disk
+            t.close()
+        except Exception as e:
+            # if there was some exception, print the error and return False
+            print(e)
+            return False
+
+        # Confirm file download is completed
+        file_size = os.stat(full_filename).st_size
+        if file_size == total_size:
+            return True
+        else:
+            print()
+            print('= = = = = = = = = = = = = = = = =')
+            print('==> Download stopped in the middle. Restarting..')
+            print('= = = = = = = = = = = = = = = = =')
+            print()
+            time.sleep(5)
 
 
 def load_completed_meeting_ids():
@@ -198,6 +243,31 @@ def handler(signal_received, frame):
     print(color.RED + "\nSIGINT or CTRL-C detected. Exiting gracefully." + color.END)
     exit(0)
 
+def API_ENDPOINT_DELETE_RECORDING(meeting_id):
+    API_ENDPOINT = 'https://api.zoom.us/v2/meetings/' + meeting_id + '/recordings?action=trash'
+    return API_ENDPOINT
+
+def delete_cloud_recording(meeting_id):
+    meeting_id = urllib.parse.quote(meeting_id, safe='')
+    meeting_id = urllib.parse.quote(meeting_id, safe='')
+    response = requests.delete(url=API_ENDPOINT_DELETE_RECORDING(meeting_id), headers=AUTHORIZATION_HEADER)
+
+    if not response.ok:
+        print(response.content)
+        print()
+        print('= = = = = = = = = = = = = = = = =')
+        print('==> Deleting failed.')
+        print('= = = = = = = = = = = = = = = = =')
+        print()
+    else:
+        print()
+        print('= = = = = = = = = = = = = = = = =')
+        print('==> Deleted.')
+        print('= = = = = = = = = = = = = = = = =')
+        print()
+
+    return response.ok
+
 
 # ################################################################
 # #                        MAIN                                  #
@@ -206,7 +276,7 @@ def handler(signal_received, frame):
 def main():
 
     # clear the screen buffer
-    os.system('cls' if os.name == 'nt' else 'clear')
+    # os.system('cls' if os.name == 'nt' else 'clear')
 
     # show the logo
     print('''
@@ -237,8 +307,7 @@ def main():
     users = get_user_ids()
 
     for email, user_id, first_name, last_name in users:
-        print(color.BOLD + "\nGetting recording list for {} {} ({})".format(first_name,
-                                                                            last_name, email) + color.END)
+        print(color.BOLD + "\nGetting recording list for {} {} ({})".format(first_name, last_name, email) + color.END)
         # wait n.n seconds so we don't breach the API rate limit
         # time.sleep(0.1)
         recordings = list_recordings(user_id)
@@ -246,26 +315,37 @@ def main():
         print("==> Found {} recordings".format(total_count))
 
         for index, recording in enumerate(recordings):
-            success = False
-            meeting_id = recording['uuid']
-            if meeting_id in COMPLETED_MEETING_IDS:
-                print("==> Skipping already downloaded meeting: {}".format(meeting_id))
-                continue
-
+            success = True
+            original_meeting_id = recording['uuid']
+            meeting_id = clean_unwanted_characters(original_meeting_id, '&')
+            
+            # TURN THIS ON
+            # if meeting_id in COMPLETED_MEETING_IDS:
+            #     print("==> Redownload already downloaded meeting: {}".format(meeting_id))
+            
             downloads = get_downloads(recording)
+
+            if len(downloads) == 0:
+                delete_cloud_recording(original_meeting_id)
+                
             for file_type, file_extension, download_url, recording_type, recording_id in downloads:
                 if recording_type != 'incomplete':
                     filename, foldername = format_filename(
                         recording, file_type, file_extension, recording_type, recording_id)
                     # truncate URL to 64 characters
                     truncated_url = download_url[0:64] + "..."
-                    print("==> Downloading ({} of {}) as {}: {}: {}".format(
-                        index+1, total_count, recording_type, recording_id, truncated_url))
-                    success |= download_recording(download_url, email, filename, foldername)
-                    #success = True
+                    print("==> Downloading ({} of {}) as {}: {}: {} - RECORDING UUID: {}".format(
+                        index+1, total_count, recording_type, recording_id, truncated_url, meeting_id))
+
+                    foldername += ' - UUID ' + meeting_id
+                    
+                    success = success and download_recording(download_url, email, filename, foldername)
+                    if success == False:
+                        break
                 else:
                     print("### Incomplete Recording ({} of {}) for {}".format(index+1, total_count, recording_id))
-                    success = False         
+                    success = False
+                    break      
 
             if success:
                 # if successful, write the ID of this recording to the completed file
@@ -274,11 +354,20 @@ def main():
                     log.write(meeting_id)
                     log.write('\n')
                     log.flush()
+                delete_cloud_recording(original_meeting_id)
+            else:
+                print()
+                print('= = = = = = = = = = = = = = = = =')
+                print('==> Download is not successful.')
+                print('= = = = = = = = = = = = = = = = =')
+                print()
 
     print(color.BOLD + color.GREEN + "\n*** All done! ***" + color.END)
     save_location = os.path.abspath(DOWNLOAD_DIRECTORY)
     print(color.BLUE + "\nRecordings have been saved to: " +
           color.UNDERLINE + "{}".format(save_location) + color.END + "\n")
+    for i in range(50):
+        print(color.BOLD + color.GREEN + "*** FINISHED! FINISHED! FINISHED! FINISHED! FINISHED! FINISHED! FINISHED! FINISHED! FINISHED! FINISHED! FINISHED! FINISHED! FINISHED! FINISHED! FINISHED! FINISHED! FINISHED! FINISHED! FINISHED! FINISHED! FINISHED! ***" + color.END)
 
 
 if __name__ == "__main__":

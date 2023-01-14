@@ -18,3 +18,5 @@ completed-downloads.log
 
 # Ignore Visual Studio Code Workspace
 *.code-workspace
+
+*.bat
